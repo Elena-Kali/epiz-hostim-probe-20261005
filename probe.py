@@ -1,5 +1,6 @@
 """Disposable hosting probe: synthetic marker, package imports, password-free TLS."""
 import hashlib
+import base64
 import importlib
 from importlib.metadata import version
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -11,6 +12,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 from uuid import UUID, uuid4
 
 PACKAGES = {
@@ -19,6 +21,61 @@ PACKAGES = {
     'httpx': 'httpx', 'cryptography': 'cryptography', 'pyotp': 'pyotp',
     'qrcode': 'qrcode', 'boto3': 'boto3', 'paramiko': 'paramiko',
 }
+
+FIXTURE = [(1, 'Synthetic card A', 'Draft A'),
+           (2, 'Synthetic card B', 'Draft B'),
+           (3, 'Synthetic card C', 'Draft C')]
+
+def decode_ca(value):
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except Exception:
+        raise ValueError('invalid-ca') from None
+    if len(raw) > 32768 or b'PRIVATE KEY' in raw or not raw.startswith(b'-----BEGIN CERTIFICATE-----'):
+        raise ValueError('invalid-ca')
+    return raw
+
+def cards_digest(rows):
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=True, separators=(',', ':')).encode('ascii')).hexdigest()
+
+def database_report(tls, cafile):
+    if tls['state'] != 'verified':
+        return {'state': 'not-tested', 'reason': 'tls-not-verified'}
+    env = os.environ
+    if not all(env.get(k) for k in ('EPIZ_PROBE_DB_USER', 'EPIZ_PROBE_DB_PASSWORD', 'EPIZ_PROBE_DB_NAME')):
+        return {'state': 'not-configured'}
+    mode = env.get('EPIZ_PROBE_MODE', 'inspect')
+    if mode not in ('inspect', 'seed', 'mutate'):
+        return {'state': 'invalid-mode'}
+    try:
+        import psycopg
+        with psycopg.connect(host=env['EPIZ_PROBE_DB_HOST'], port=5432,
+                             user=env['EPIZ_PROBE_DB_USER'], password=env['EPIZ_PROBE_DB_PASSWORD'],
+                             dbname=env['EPIZ_PROBE_DB_NAME'], sslmode='verify-full', sslrootcert=cafile,
+                             connect_timeout=8, options='-c statement_timeout=8000 -c lock_timeout=5000',
+                             application_name='epiz-disposable-probe-261005') as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
+                ssl_status = cursor.fetchone()
+                if not ssl_status or ssl_status[0] is not True:
+                    raise ValueError('unverified-connection')
+                if mode == 'seed':
+                    cursor.execute('CREATE SCHEMA IF NOT EXISTS epiz_disposable_probe_261005')
+                    cursor.execute('CREATE TABLE IF NOT EXISTS epiz_disposable_probe_261005.cards '
+                                   '(id integer PRIMARY KEY, title text NOT NULL, body text NOT NULL)')
+                    cursor.execute('SELECT count(*) FROM epiz_disposable_probe_261005.cards')
+                    if cursor.fetchone()[0] == 0:
+                        cursor.executemany('INSERT INTO epiz_disposable_probe_261005.cards VALUES (%s, %s, %s)', FIXTURE)
+                if mode == 'mutate':
+                    cursor.execute('UPDATE epiz_disposable_probe_261005.cards SET body = %s WHERE id = 1',
+                                   ('Changed after backup',))
+                cursor.execute('SELECT id, title, body FROM epiz_disposable_probe_261005.cards ORDER BY id')
+                rows = cursor.fetchall()
+                return {'state': 'ok', 'mode': mode, 'card_count': len(rows), 'sha256': cards_digest(rows),
+                        'fixture_matches': rows == FIXTURE, 'tls_version': ssl_status[1]}
+    except Exception:
+        # Never publish a DSN, exception message, credentials or card bodies.
+        return {'state': 'failed', 'mode': mode}
 
 def imports():
     result = {}
@@ -101,15 +158,30 @@ def main():
         node = subprocess.run(['node', '--version'], check=True, capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         node = 'failed'
+    cafile = os.environ.get('EPIZ_PROBE_DB_CA_FILE')
+    ca_state = 'not-configured'
+    if os.environ.get('EPIZ_PROBE_DB_CA_BASE64'):
+        try:
+            raw_ca = decode_ca(os.environ['EPIZ_PROBE_DB_CA_BASE64'])
+            fd, cafile = tempfile.mkstemp(prefix='epiz-ca-', suffix='.crt')
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(raw_ca)
+            ca_state = 'loaded'
+        except (OSError, ValueError):
+            ca_state = 'failed'
     tls = tls_report(os.environ.get('EPIZ_PROBE_DB_HOST'),
                      server_name=os.environ.get('EPIZ_PROBE_DB_SERVER_NAME'),
-                     cafile=os.environ.get('EPIZ_PROBE_DB_CA_FILE'))
+                     cafile=cafile) if ca_state != 'failed' else {'state': 'invalid-ca'}
+    negative_tls = tls_report(os.environ.get('EPIZ_PROBE_DB_HOST'), server_name='wrong-name.invalid',
+                              cafile=cafile) if tls['state'] == 'verified' else {'state': 'not-tested'}
+    database = database_report(tls, cafile)
     report = {'scope': 'disposable-hostim-probe', 'python': platform.python_version(),
               'platform': platform.system(), 'node': node, 'dependencies': dependencies,
               'local_marker': marker_report('/tmp/epiz-hostim-probe'), 'database_tls': tls,
-              'authentication': 'not-tested', 'migrations': 'not-tested', 'backup_restore': 'not-tested',
+              'ca': ca_state, 'wrong_name_tls': negative_tls, 'database': database,
+              'backup_restore': 'not-tested',
               'runtime_ok': all(item['state'] == 'ok' for item in dependencies.values()) and node != 'failed',
-              'database_ready': tls['state'] == 'verified'}
+              'database_ready': tls['state'] == 'verified' and database['state'] == 'ok'}
     print(json.dumps(report), flush=True)
     make_server(report, host='0.0.0.0', port=int(os.environ.get('PORT', '8080'))).serve_forever()
 
