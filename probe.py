@@ -175,7 +175,7 @@ def main():
     negative_tls = tls_report(os.environ.get('EPIZ_PROBE_DB_HOST'), server_name='wrong-name.invalid',
                               cafile=cafile) if tls['state'] == 'verified' else {'state': 'not-tested'}
     database = database_report(tls, cafile)
-    report = {'scope': 'disposable-hostim-probe', 'python': platform.python_version(),
+    report = {'scope': 'disposable-hostim-probe', 'probe_revision': 'workflow-update-2', 'python': platform.python_version(),
               'platform': platform.system(), 'node': node, 'dependencies': dependencies,
               'local_marker': marker_report('/tmp/epiz-hostim-probe'), 'database_tls': tls,
               'ca': ca_state, 'wrong_name_tls': negative_tls, 'database': database,
